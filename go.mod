@@ -6,14 +6,14 @@ require (
 	github.com/cenkalti/backoff/v4 v4.1.3
 	github.com/golang-jwt/jwt v3.2.2+incompatible
 	github.com/golang/protobuf v1.5.3
-	github.com/google/uuid v1.3.0
+	github.com/google/uuid v1.5.0
 	github.com/gorilla/mux v1.8.0
 	github.com/kardianos/service v1.2.1-0.20210728001519-a323c3813bc7
 	github.com/onsi/ginkgo v1.16.5
 	github.com/onsi/gomega v1.18.1
 	github.com/pion/ice/v2 v2.3.1
 	github.com/rs/cors v1.8.0
-	github.com/sirupsen/logrus v1.9.0
+	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.6.1
 	github.com/spf13/pflag v1.0.5
 	github.com/vishvananda/netlink v1.1.0
@@ -42,6 +42,7 @@ require (
 	github.com/google/go-cmp v0.5.9
 	github.com/google/gopacket v1.1.19
 	github.com/google/nftables v0.0.0-20220808154552-2eca00135732
+	github.com/gorilla/websocket v1.4.2
 	github.com/hashicorp/go-secure-stdlib/base62 v0.1.2
 	github.com/hashicorp/go-version v1.6.0
 	github.com/libp2p/go-netroute v0.2.0
@@ -122,6 +123,7 @@ require (
 	github.com/mdlayher/netlink v1.7.1 // indirect
 	github.com/nxadm/tail v1.4.8 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
+	github.com/pappz/dispatcher v0.0.0-20231214222316-ddc88a747b36 // indirect
 	github.com/pegasus-kv/thrift v0.13.0 // indirect
 	github.com/pion/dtls/v2 v2.2.6 // indirect
 	github.com/pion/mdns v0.0.7 // indirect

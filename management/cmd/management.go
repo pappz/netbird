@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/miekg/dns"
+	"github.com/pappz/dispatcher"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/acme/autocert"
@@ -198,13 +199,15 @@ var (
 				return fmt.Errorf("failed creating JWT validator: %v", err)
 			}
 
+			dispatcherStore := dispatcher.NewStore()
+
 			httpAPIAuthCfg := httpapi.AuthCfg{
 				Issuer:       config.HttpConfig.AuthIssuer,
 				Audience:     config.HttpConfig.AuthAudience,
 				UserIDClaim:  config.HttpConfig.AuthUserIDClaim,
 				KeysLocation: config.HttpConfig.AuthKeysLocation,
 			}
-			httpAPIHandler, err := httpapi.APIHandler(accountManager, *jwtValidator, appMetrics, httpAPIAuthCfg)
+			httpAPIHandler, err := httpapi.APIHandler(accountManager, *jwtValidator, appMetrics, httpAPIAuthCfg, dispatcherStore)
 			if err != nil {
 				return fmt.Errorf("failed creating HTTP API handler: %v", err)
 			}
@@ -213,7 +216,7 @@ var (
 			ephemeralManager.LoadInitialPeers()
 
 			gRPCAPIHandler := grpc.NewServer(gRPCOpts...)
-			srv, err := server.NewServer(config, accountManager, peersUpdateManager, turnManager, appMetrics, ephemeralManager)
+			srv, err := server.NewServer(config, accountManager, peersUpdateManager, turnManager, appMetrics, ephemeralManager, dispatcherStore)
 			if err != nil {
 				return fmt.Errorf("failed creating gRPC API handler: %v", err)
 			}

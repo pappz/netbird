@@ -4,9 +4,11 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/rs/cors"
-
 	"github.com/netbirdio/management-integrations/integrations"
+	"github.com/pappz/dispatcher"
+	"github.com/rs/cors"
+	log "github.com/sirupsen/logrus"
+
 	s "github.com/netbirdio/netbird/management/server"
 	"github.com/netbirdio/netbird/management/server/http/middleware"
 	"github.com/netbirdio/netbird/management/server/jwtclaims"
@@ -23,8 +25,10 @@ type AuthCfg struct {
 
 type apiHandler struct {
 	Router         *mux.Router
+	RouterWs       *mux.Router
 	AccountManager s.AccountManager
 	AuthCfg        AuthCfg
+	PeerStore      *dispatcher.Store
 }
 
 // EmptyObject is an empty struct used to return empty JSON object
@@ -32,7 +36,7 @@ type emptyObject struct {
 }
 
 // APIHandler creates the Management service HTTP API handler registering all the available endpoints.
-func APIHandler(accountManager s.AccountManager, jwtValidator jwtclaims.JWTValidator, appMetrics telemetry.AppMetrics, authCfg AuthCfg) (http.Handler, error) {
+func APIHandler(accountManager s.AccountManager, jwtValidator jwtclaims.JWTValidator, appMetrics telemetry.AppMetrics, authCfg AuthCfg, peerStore *dispatcher.Store) (http.Handler, error) {
 	authMiddleware := middleware.NewAuthMiddleware(
 		accountManager.GetAccountFromPAT,
 		jwtValidator.ValidateAndParse,
@@ -53,10 +57,15 @@ func APIHandler(accountManager s.AccountManager, jwtValidator jwtclaims.JWTValid
 	router := rootRouter.PathPrefix("/api").Subrouter()
 	router.Use(metricsMiddleware.Handler, corsMiddleware.Handler, authMiddleware.Handler, acMiddleware.Handler)
 
+	routerWs := rootRouter.PathPrefix("/ws").Subrouter()
+	routerWs.Use(corsMiddleware.Handler)
+
 	api := apiHandler{
 		Router:         router,
+		RouterWs:       routerWs,
 		AccountManager: accountManager,
 		AuthCfg:        authCfg,
+		PeerStore:      peerStore,
 	}
 
 	claimsExtractor := jwtclaims.NewClaimsExtractor(
@@ -77,6 +86,7 @@ func APIHandler(accountManager s.AccountManager, jwtValidator jwtclaims.JWTValid
 	api.addDNSNameserversEndpoint()
 	api.addDNSSettingEndpoint()
 	api.addEventsEndpoint()
+	api.addWebExchangeWSEndpoint()
 
 	err := api.Router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
 		methods, err := route.GetMethods()
@@ -86,14 +96,17 @@ func APIHandler(accountManager s.AccountManager, jwtValidator jwtclaims.JWTValid
 		for _, method := range methods {
 			template, err := route.GetPathTemplate()
 			if err != nil {
+				log.Errorf("error getting path template: %v", err)
 				return err
 			}
+
 			err = metricsMiddleware.AddHTTPRequestResponseCounter(template, method)
 			if err != nil {
 				return err
 			}
 		}
 		return nil
+
 	})
 	if err != nil {
 		return nil, err
@@ -194,4 +207,9 @@ func (apiHandler *apiHandler) addDNSSettingEndpoint() {
 func (apiHandler *apiHandler) addEventsEndpoint() {
 	eventsHandler := NewEventsHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
 	apiHandler.Router.HandleFunc("/events", eventsHandler.GetAllEvents).Methods("GET", "OPTIONS")
+}
+
+func (apiHandler *apiHandler) addWebExchangeWSEndpoint() {
+	h := NewDispatcherHandler(apiHandler.AccountManager, apiHandler.AuthCfg, apiHandler.PeerStore)
+	apiHandler.RouterWs.HandleFunc("/terminal/{peerid}", h.Connect)
 }

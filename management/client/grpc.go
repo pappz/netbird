@@ -33,10 +33,12 @@ type ConnStateNotifier interface {
 }
 
 type GrpcClient struct {
-	key                   wgtypes.Key
-	realClient            proto.ManagementServiceClient
-	ctx                   context.Context
-	conn                  *grpc.ClientConn
+	ctx context.Context
+	key wgtypes.Key
+
+	realClient proto.ManagementServiceClient
+	conn       *grpc.ClientConn
+
 	connStateCallback     ConnStateNotifier
 	connStateCallbackLock sync.RWMutex
 }
@@ -65,14 +67,11 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 		return nil, err
 	}
 
-	realClient := proto.NewManagementServiceClient(conn)
-
 	return &GrpcClient{
-		key:                   ourPrivateKey,
-		realClient:            realClient,
-		ctx:                   ctx,
-		conn:                  conn,
-		connStateCallbackLock: sync.RWMutex{},
+		ctx:        ctx,
+		key:        ourPrivateKey,
+		realClient: proto.NewManagementServiceClient(conn),
+		conn:       conn,
 	}, nil
 }
 
@@ -131,7 +130,7 @@ func (c *GrpcClient) Sync(msgHandler func(msg *proto.SyncResponse) error) error 
 
 		ctx, cancelStream := context.WithCancel(c.ctx)
 		defer cancelStream()
-		stream, err := c.connectToStream(ctx, *serverPubKey)
+		stream, err := c.connectToSyncStream(ctx, *serverPubKey)
 		if err != nil {
 			log.Debugf("failed to open Management Service stream: %s", err)
 			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.PermissionDenied {
@@ -143,7 +142,7 @@ func (c *GrpcClient) Sync(msgHandler func(msg *proto.SyncResponse) error) error 
 		log.Infof("connected to the Management Service stream")
 		c.notifyConnected()
 		// blocking until error
-		err = c.receiveEvents(stream, *serverPubKey, msgHandler)
+		err = c.receiveSyncEvents(stream, *serverPubKey, msgHandler)
 		if err != nil {
 			s, _ := gstatus.FromError(err)
 			switch s.Code() {
@@ -172,6 +171,60 @@ func (c *GrpcClient) Sync(msgHandler func(msg *proto.SyncResponse) error) error 
 	return nil
 }
 
+func (c *GrpcClient) Dispatcher(visitorHandler VisitorHandler) error {
+	backOff := defaultBackoff(c.ctx)
+	operation := func() error {
+
+		serverPubKey, err := c.GetServerPublicKey()
+		if err != nil {
+			log.Debugf("failed getting Management Service public key: %s", err)
+			return err
+		}
+
+		ctx, cancelStream := context.WithCancel(c.ctx)
+		defer cancelStream()
+		stream, err := c.realClient.Dispatcher(ctx)
+		if err != nil {
+			log.Debugf("failed to open Message Exchange stream: %s", err)
+			if s, ok := gstatus.FromError(err); ok && s.Code() == codes.PermissionDenied {
+				return backoff.Permanent(err) // unrecoverable error, propagate to the upper layer
+			}
+			return err
+		}
+		log.Infof("connected to the Message Exchange stream")
+		we := newDispatcher(ctx, stream, *serverPubKey, c.key, visitorHandler)
+		visitorHandler.SetChannel(we)
+		err = we.sendHelloMsg()
+		if err != nil {
+			log.Errorf("failed to send hello message: %s", err)
+			return err
+		}
+		err = we.receiveDispatchEvents()
+		if err != nil {
+			s, _ := gstatus.FromError(err)
+			switch s.Code() {
+			case codes.PermissionDenied:
+				return backoff.Permanent(err)
+			case codes.Canceled:
+				log.Debugf("management connection context has been canceled, this usually indicates shutdown")
+				return nil
+			default:
+				backOff.Reset() // reset backoff counter after successful connection
+				log.Warnf("disconnected from the Management service but will retry silently. Reason: %v", err)
+				return err
+			}
+		}
+		return nil
+	}
+
+	err := backoff.Retry(operation, backOff)
+	if err != nil {
+		log.Warnf("exiting the WebExchange service connection retry loop due to the unrecoverable error: %s", err)
+		return err
+	}
+	return nil
+}
+
 // GetNetworkMap return with the network map
 func (c *GrpcClient) GetNetworkMap() (*proto.NetworkMap, error) {
 	serverPubKey, err := c.GetServerPublicKey()
@@ -182,7 +235,7 @@ func (c *GrpcClient) GetNetworkMap() (*proto.NetworkMap, error) {
 
 	ctx, cancelStream := context.WithCancel(c.ctx)
 	defer cancelStream()
-	stream, err := c.connectToStream(ctx, *serverPubKey)
+	stream, err := c.connectToSyncStream(ctx, *serverPubKey)
 	if err != nil {
 		log.Debugf("failed to open Management Service stream: %s", err)
 		return nil, err
@@ -215,26 +268,18 @@ func (c *GrpcClient) GetNetworkMap() (*proto.NetworkMap, error) {
 	return decryptedResp.GetNetworkMap(), nil
 }
 
-func (c *GrpcClient) connectToStream(ctx context.Context, serverPubKey wgtypes.Key) (proto.ManagementService_SyncClient, error) {
+func (c *GrpcClient) connectToSyncStream(ctx context.Context, serverPubKey wgtypes.Key) (proto.ManagementService_SyncClient, error) {
 	req := &proto.SyncRequest{}
-
-	myPrivateKey := c.key
-	myPublicKey := myPrivateKey.PublicKey()
-
-	encryptedReq, err := encryption.EncryptMessage(serverPubKey, myPrivateKey, req)
+	encryptedReq, err := encryption.EncryptMessage(serverPubKey, c.key, req)
 	if err != nil {
 		log.Errorf("failed encrypting message: %s", err)
 		return nil, err
 	}
-	syncReq := &proto.EncryptedMessage{WgPubKey: myPublicKey.String(), Body: encryptedReq}
-	sync, err := c.realClient.Sync(ctx, syncReq)
-	if err != nil {
-		return nil, err
-	}
-	return sync, nil
+	syncReq := &proto.EncryptedMessage{WgPubKey: c.key.PublicKey().String(), Body: encryptedReq}
+	return c.realClient.Sync(ctx, syncReq)
 }
 
-func (c *GrpcClient) receiveEvents(stream proto.ManagementService_SyncClient, serverPubKey wgtypes.Key, msgHandler func(msg *proto.SyncResponse) error) error {
+func (c *GrpcClient) receiveSyncEvents(stream proto.ManagementService_SyncClient, serverPubKey wgtypes.Key, msgHandler func(msg *proto.SyncResponse) error) error {
 	for {
 		update, err := stream.Recv()
 		if err == io.EOF {

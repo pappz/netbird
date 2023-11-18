@@ -3,14 +3,16 @@ package client
 import (
 	"io"
 
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
 	"github.com/netbirdio/netbird/client/system"
 	"github.com/netbirdio/netbird/management/proto"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 type Client interface {
 	io.Closer
 	Sync(msgHandler func(msg *proto.SyncResponse) error) error
+	Dispatcher(handler VisitorHandler) error
 	GetServerPublicKey() (*wgtypes.Key, error)
 	Register(serverKey wgtypes.Key, setupKey string, jwtToken string, sysInfo *system.Info, sshKey []byte) (*proto.LoginResponse, error)
 	Login(serverKey wgtypes.Key, sysInfo *system.Info, sshKey []byte) (*proto.LoginResponse, error)

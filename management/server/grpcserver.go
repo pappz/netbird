@@ -3,10 +3,10 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
-	pb "github.com/golang/protobuf/proto" // nolint
 	"github.com/golang/protobuf/ptypes/timestamp"
 	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -14,7 +14,8 @@ import (
 	gRPCPeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	"github.com/netbirdio/netbird/encryption"
+	"github.com/pappz/dispatcher"
+
 	"github.com/netbirdio/netbird/management/proto"
 	"github.com/netbirdio/netbird/management/server/jwtclaims"
 	internalStatus "github.com/netbirdio/netbird/management/server/status"
@@ -23,20 +24,24 @@ import (
 
 // GRPCServer an instance of a Management gRPC API server
 type GRPCServer struct {
-	accountManager AccountManager
-	wgKey          wgtypes.Key
 	proto.UnimplementedManagementServiceServer
-	peersUpdateManager     *PeersUpdateManager
+
 	config                 *Config
+	accountManager         AccountManager
+	peersUpdateManager     *PeersUpdateManager
 	turnCredentialsManager TURNCredentialsManager
-	jwtValidator           *jwtclaims.JWTValidator
-	jwtClaimsExtractor     *jwtclaims.ClaimsExtractor
 	appMetrics             telemetry.AppMetrics
 	ephemeralManager       *EphemeralManager
+	dispatcherStore        dispatcher.Store
+
+	serverPubkey       string
+	jwtValidator       *jwtclaims.JWTValidator
+	jwtClaimsExtractor *jwtclaims.ClaimsExtractor
+	grpcMsgEncrypt     *grpcEncrypt
 }
 
 // NewServer creates a new Management server
-func NewServer(config *Config, accountManager AccountManager, peersUpdateManager *PeersUpdateManager, turnCredentialsManager TURNCredentialsManager, appMetrics telemetry.AppMetrics, ephemeralManager *EphemeralManager) (*GRPCServer, error) {
+func NewServer(config *Config, accountManager AccountManager, peersUpdateManager *PeersUpdateManager, turnCredentialsManager TURNCredentialsManager, appMetrics telemetry.AppMetrics, ephemeralManager *EphemeralManager, peerStore *dispatcher.Store) (*GRPCServer, error) {
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		return nil, err
@@ -79,16 +84,18 @@ func NewServer(config *Config, accountManager AccountManager, peersUpdateManager
 	)
 
 	return &GRPCServer{
-		wgKey: key,
-		// peerKey -> event channel
+		config:                 config,
 		peersUpdateManager:     peersUpdateManager,
 		accountManager:         accountManager,
-		config:                 config,
 		turnCredentialsManager: turnCredentialsManager,
-		jwtValidator:           jwtValidator,
-		jwtClaimsExtractor:     jwtClaimsExtractor,
 		appMetrics:             appMetrics,
 		ephemeralManager:       ephemeralManager,
+		dispatcherStore:        *peerStore,
+
+		serverPubkey:       key.PublicKey().String(),
+		jwtValidator:       jwtValidator,
+		jwtClaimsExtractor: jwtClaimsExtractor,
+		grpcMsgEncrypt:     newGrpcEncrypt(key),
 	}, nil
 }
 
@@ -103,7 +110,7 @@ func (s *GRPCServer) GetServerKey(ctx context.Context, req *proto.Empty) (*proto
 	expiresAt := &timestamp.Timestamp{Seconds: secs, Nanos: nanos}
 
 	return &proto.ServerKeyResponse{
-		Key:       s.wgKey.PublicKey().String(),
+		Key:       s.serverPubkey,
 		ExpiresAt: expiresAt,
 	}, nil
 }
@@ -121,9 +128,9 @@ func (s *GRPCServer) Sync(req *proto.EncryptedMessage, srv proto.ManagementServi
 	}
 
 	syncReq := &proto.SyncRequest{}
-	peerKey, err := s.parseRequest(req, syncReq)
+	peerKey, err := s.grpcMsgEncrypt.parseRequest(req, syncReq)
 	if err != nil {
-		return err
+		return status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	peer, netMap, err := s.accountManager.SyncPeer(PeerSync{WireGuardPubKey: peerKey.String()})
@@ -171,16 +178,13 @@ func (s *GRPCServer) Sync(req *proto.EncryptedMessage, srv proto.ManagementServi
 			}
 			log.Debugf("received an update for peer %s", peerKey.String())
 
-			encryptedResp, err := encryption.EncryptMessage(peerKey, s.wgKey, update.Update)
+			msg, err := s.grpcMsgEncrypt.encryptMsg(peerKey, update.Update)
 			if err != nil {
 				s.cancelPeerRoutines(peer)
 				return status.Errorf(codes.Internal, "failed processing update message")
 			}
 
-			err = srv.SendMsg(&proto.EncryptedMessage{
-				WgPubKey: s.wgKey.PublicKey().String(),
-				Body:     encryptedResp,
-			})
+			err = srv.SendMsg(msg)
 			if err != nil {
 				s.cancelPeerRoutines(peer)
 				return status.Errorf(codes.Internal, "failed sending update message")
@@ -194,6 +198,40 @@ func (s *GRPCServer) Sync(req *proto.EncryptedMessage, srv proto.ManagementServi
 			return srv.Context().Err()
 		}
 	}
+}
+
+func (s *GRPCServer) Dispatcher(stream proto.ManagementService_DispatcherServer) error {
+	encryptedMsg, err := stream.Recv()
+	if err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+
+	// todo: change this logic! Do not read dummy msg just for the identification of the peer
+	msg := &proto.DispatchSessionData{}
+	log.Debugf("got a new Dispatcher request from peer %s", encryptedMsg.WgPubKey)
+	peerKey, err := s.grpcMsgEncrypt.parseRequest(encryptedMsg, msg)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	// dig id of peer from the request
+	// it is unnecessary if authenticate the WS conn and replace the id to peer key
+	peer, _, err := s.accountManager.SyncPeer(PeerSync{WireGuardPubKey: peerKey.String()})
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	grpcSrv := newGrpcDispatcherSrv(peerKey, s.grpcMsgEncrypt, stream)
+	d := dispatcher.NewDevice(peer.ID, grpcSrv)
+	s.dispatcherStore.AddDevice(d)
+
+	<-stream.Context().Done()
+	s.dispatcherStore.RemoveDevice(d)
+	return stream.Context().Err()
+
 }
 
 func (s *GRPCServer) cancelPeerRoutines(peer *Peer) {
@@ -256,21 +294,6 @@ func extractPeerMeta(loginReq *proto.LoginRequest) PeerSystemMeta {
 	}
 }
 
-func (s *GRPCServer) parseRequest(req *proto.EncryptedMessage, parsed pb.Message) (wgtypes.Key, error) {
-	peerKey, err := wgtypes.ParseKey(req.GetWgPubKey())
-	if err != nil {
-		log.Warnf("error while parsing peer's WireGuard public key %s.", req.WgPubKey)
-		return wgtypes.Key{}, status.Errorf(codes.InvalidArgument, "provided wgPubKey %s is invalid", req.WgPubKey)
-	}
-
-	err = encryption.DecryptMessage(peerKey, s.wgKey, req.Body, parsed)
-	if err != nil {
-		return wgtypes.Key{}, status.Errorf(codes.InvalidArgument, "invalid request message")
-	}
-
-	return peerKey, nil
-}
-
 // Login endpoint first checks whether peer is registered under any account
 // In case it is, the login is successful
 // In case it isn't, the endpoint checks whether setup key is provided within the request and tries to register a peer.
@@ -291,14 +314,14 @@ func (s *GRPCServer) Login(ctx context.Context, req *proto.EncryptedMessage) (*p
 	}
 
 	loginReq := &proto.LoginRequest{}
-	peerKey, err := s.parseRequest(req, loginReq)
+	peerKey, err := s.grpcMsgEncrypt.parseRequest(req, loginReq)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if loginReq.GetMeta() == nil {
 		msg := status.Errorf(codes.FailedPrecondition,
-			"peer system meta has to be provided to log in. Peer %s, remote addr %s", peerKey.String(),
+			"peer system meta has to be provided to log in. Device %s, remote addr %s", peerKey.String(),
 			p.Addr.String())
 		log.Warn(msg)
 		return nil, msg
@@ -342,16 +365,14 @@ func (s *GRPCServer) Login(ctx context.Context, req *proto.EncryptedMessage) (*p
 		WiretrusteeConfig: toWiretrusteeConfig(s.config, nil),
 		PeerConfig:        toPeerConfig(peer, netMap.Network, s.accountManager.GetDNSDomain()),
 	}
-	encryptedResp, err := encryption.EncryptMessage(peerKey, s.wgKey, loginResp)
+
+	encryptedResp, err := s.grpcMsgEncrypt.encryptMsg(peerKey, loginResp)
 	if err != nil {
 		log.Warnf("failed encrypting peer %s message", peer.ID)
 		return nil, status.Errorf(codes.Internal, "failed logging in peer")
 	}
 
-	return &proto.EncryptedMessage{
-		WgPubKey: s.wgKey.PublicKey().String(),
-		Body:     encryptedResp,
-	}, nil
+	return encryptedResp, nil
 }
 
 func ToResponseProto(configProto Protocol) proto.HostConfig_Protocol {
@@ -488,15 +509,12 @@ func (s *GRPCServer) sendInitialSync(peerKey wgtypes.Key, peer *Peer, networkMap
 	}
 	plainResp := toSyncResponse(s.config, peer, turnCredentials, networkMap, s.accountManager.GetDNSDomain())
 
-	encryptedResp, err := encryption.EncryptMessage(peerKey, s.wgKey, plainResp)
+	encryptedResp, err := s.grpcMsgEncrypt.encryptMsg(peerKey, plainResp)
 	if err != nil {
 		return status.Errorf(codes.Internal, "error handling request")
 	}
 
-	err = srv.Send(&proto.EncryptedMessage{
-		WgPubKey: s.wgKey.PublicKey().String(),
-		Body:     encryptedResp,
-	})
+	err = srv.Send(encryptedResp)
 
 	if err != nil {
 		log.Errorf("failed sending SyncResponse %v", err)
@@ -510,18 +528,9 @@ func (s *GRPCServer) sendInitialSync(peerKey wgtypes.Key, peer *Peer, networkMap
 // This is used for initiating an Oauth 2 device authorization grant flow
 // which will be used by our clients to Login
 func (s *GRPCServer) GetDeviceAuthorizationFlow(ctx context.Context, req *proto.EncryptedMessage) (*proto.EncryptedMessage, error) {
-	peerKey, err := wgtypes.ParseKey(req.GetWgPubKey())
+	peerKey, err := s.grpcMsgEncrypt.parseRequest(req, &proto.DeviceAuthorizationFlowRequest{})
 	if err != nil {
-		errMSG := fmt.Sprintf("error while parsing peer's Wireguard public key %s on GetDeviceAuthorizationFlow request.", req.WgPubKey)
-		log.Warn(errMSG)
-		return nil, status.Error(codes.InvalidArgument, errMSG)
-	}
-
-	err = encryption.DecryptMessage(peerKey, s.wgKey, req.Body, &proto.DeviceAuthorizationFlowRequest{})
-	if err != nil {
-		errMSG := fmt.Sprintf("error while decrypting peer's message with Wireguard public key %s.", req.WgPubKey)
-		log.Warn(errMSG)
-		return nil, status.Error(codes.InvalidArgument, errMSG)
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if s.config.DeviceAuthorizationFlow == nil || s.config.DeviceAuthorizationFlow.Provider == string(NONE) {
@@ -547,33 +556,21 @@ func (s *GRPCServer) GetDeviceAuthorizationFlow(ctx context.Context, req *proto.
 		},
 	}
 
-	encryptedResp, err := encryption.EncryptMessage(peerKey, s.wgKey, flowInfoResp)
+	encryptedResp, err := s.grpcMsgEncrypt.encryptMsg(peerKey, flowInfoResp)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "failed to encrypt no device authorization flow information")
 	}
 
-	return &proto.EncryptedMessage{
-		WgPubKey: s.wgKey.PublicKey().String(),
-		Body:     encryptedResp,
-	}, nil
+	return encryptedResp, nil
 }
 
 // GetPKCEAuthorizationFlow returns a pkce authorization flow information
 // This is used for initiating an Oauth 2 pkce authorization grant flow
 // which will be used by our clients to Login
 func (s *GRPCServer) GetPKCEAuthorizationFlow(_ context.Context, req *proto.EncryptedMessage) (*proto.EncryptedMessage, error) {
-	peerKey, err := wgtypes.ParseKey(req.GetWgPubKey())
+	peerKey, err := s.grpcMsgEncrypt.parseRequest(req, &proto.PKCEAuthorizationFlowRequest{})
 	if err != nil {
-		errMSG := fmt.Sprintf("error while parsing peer's Wireguard public key %s on GetPKCEAuthorizationFlow request.", req.WgPubKey)
-		log.Warn(errMSG)
-		return nil, status.Error(codes.InvalidArgument, errMSG)
-	}
-
-	err = encryption.DecryptMessage(peerKey, s.wgKey, req.Body, &proto.PKCEAuthorizationFlowRequest{})
-	if err != nil {
-		errMSG := fmt.Sprintf("error while decrypting peer's message with Wireguard public key %s.", req.WgPubKey)
-		log.Warn(errMSG)
-		return nil, status.Error(codes.InvalidArgument, errMSG)
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
 	if s.config.PKCEAuthorizationFlow == nil {
@@ -593,13 +590,10 @@ func (s *GRPCServer) GetPKCEAuthorizationFlow(_ context.Context, req *proto.Encr
 		},
 	}
 
-	encryptedResp, err := encryption.EncryptMessage(peerKey, s.wgKey, flowInfoResp)
+	encryptedResp, err := s.grpcMsgEncrypt.encryptMsg(peerKey, flowInfoResp)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "failed to encrypt no pkce authorization flow information")
 	}
 
-	return &proto.EncryptedMessage{
-		WgPubKey: s.wgKey.PublicKey().String(),
-		Body:     encryptedResp,
-	}, nil
+	return encryptedResp, nil
 }

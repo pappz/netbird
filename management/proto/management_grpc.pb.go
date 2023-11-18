@@ -26,6 +26,7 @@ type ManagementServiceClient interface {
 	// The initial SyncResponse contains all of the available peers so the local state can be refreshed
 	// Returns encrypted SyncResponse in EncryptedMessage.Body
 	Sync(ctx context.Context, in *EncryptedMessage, opts ...grpc.CallOption) (ManagementService_SyncClient, error)
+	Dispatcher(ctx context.Context, opts ...grpc.CallOption) (ManagementService_DispatcherClient, error)
 	// Exposes a Wireguard public key of the Management service.
 	// This key is used to support message encryption between client and server
 	GetServerKey(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ServerKeyResponse, error)
@@ -94,6 +95,37 @@ func (x *managementServiceSyncClient) Recv() (*EncryptedMessage, error) {
 	return m, nil
 }
 
+func (c *managementServiceClient) Dispatcher(ctx context.Context, opts ...grpc.CallOption) (ManagementService_DispatcherClient, error) {
+	stream, err := c.cc.NewStream(ctx, &ManagementService_ServiceDesc.Streams[1], "/management.ManagementService/Dispatcher", opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &managementServiceDispatcherClient{stream}
+	return x, nil
+}
+
+type ManagementService_DispatcherClient interface {
+	Send(*EncryptedMessage) error
+	Recv() (*EncryptedMessage, error)
+	grpc.ClientStream
+}
+
+type managementServiceDispatcherClient struct {
+	grpc.ClientStream
+}
+
+func (x *managementServiceDispatcherClient) Send(m *EncryptedMessage) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *managementServiceDispatcherClient) Recv() (*EncryptedMessage, error) {
+	m := new(EncryptedMessage)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *managementServiceClient) GetServerKey(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*ServerKeyResponse, error) {
 	out := new(ServerKeyResponse)
 	err := c.cc.Invoke(ctx, "/management.ManagementService/GetServerKey", in, out, opts...)
@@ -142,6 +174,7 @@ type ManagementServiceServer interface {
 	// The initial SyncResponse contains all of the available peers so the local state can be refreshed
 	// Returns encrypted SyncResponse in EncryptedMessage.Body
 	Sync(*EncryptedMessage, ManagementService_SyncServer) error
+	Dispatcher(ManagementService_DispatcherServer) error
 	// Exposes a Wireguard public key of the Management service.
 	// This key is used to support message encryption between client and server
 	GetServerKey(context.Context, *Empty) (*ServerKeyResponse, error)
@@ -171,6 +204,9 @@ func (UnimplementedManagementServiceServer) Login(context.Context, *EncryptedMes
 }
 func (UnimplementedManagementServiceServer) Sync(*EncryptedMessage, ManagementService_SyncServer) error {
 	return status.Errorf(codes.Unimplemented, "method Sync not implemented")
+}
+func (UnimplementedManagementServiceServer) Dispatcher(ManagementService_DispatcherServer) error {
+	return status.Errorf(codes.Unimplemented, "method Dispatcher not implemented")
 }
 func (UnimplementedManagementServiceServer) GetServerKey(context.Context, *Empty) (*ServerKeyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetServerKey not implemented")
@@ -234,6 +270,32 @@ type managementServiceSyncServer struct {
 
 func (x *managementServiceSyncServer) Send(m *EncryptedMessage) error {
 	return x.ServerStream.SendMsg(m)
+}
+
+func _ManagementService_Dispatcher_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ManagementServiceServer).Dispatcher(&managementServiceDispatcherServer{stream})
+}
+
+type ManagementService_DispatcherServer interface {
+	Send(*EncryptedMessage) error
+	Recv() (*EncryptedMessage, error)
+	grpc.ServerStream
+}
+
+type managementServiceDispatcherServer struct {
+	grpc.ServerStream
+}
+
+func (x *managementServiceDispatcherServer) Send(m *EncryptedMessage) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *managementServiceDispatcherServer) Recv() (*EncryptedMessage, error) {
+	m := new(EncryptedMessage)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func _ManagementService_GetServerKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -341,6 +403,12 @@ var ManagementService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "Sync",
 			Handler:       _ManagementService_Sync_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "Dispatcher",
+			Handler:       _ManagementService_Dispatcher_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "management.proto",

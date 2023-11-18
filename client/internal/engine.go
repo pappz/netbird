@@ -21,6 +21,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/dns"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/routemanager"
+	"github.com/netbirdio/netbird/client/internal/terminal"
 	"github.com/netbirdio/netbird/client/internal/wgproxy"
 	nbssh "github.com/netbirdio/netbird/client/ssh"
 	nbdns "github.com/netbirdio/netbird/dns"
@@ -118,7 +119,8 @@ type Engine struct {
 	routeManager routemanager.Manager
 	acl          acl.Manager
 
-	dnsServer dns.Server
+	dnsServer      dns.Server
+	visitorHandler *terminal.Manager
 }
 
 // Peer is an instance of the Connection Peer
@@ -272,9 +274,13 @@ func (e *Engine) Start() error {
 		return err
 	}
 
-	e.receiveSignalEvents()
-	e.receiveManagementEvents()
+	log.Debugf("create new terminal manager")
+	e.visitorHandler = terminal.NewManager()
 
+	go e.receiveSignalEvents()
+	e.signal.WaitStreamConnected()
+	go e.receiveManagementEvents()
+	go e.receiveDispatcherEvents()
 	return nil
 }
 
@@ -535,20 +541,31 @@ func (e *Engine) updateConfig(conf *mgmProto.PeerConfig) error {
 // receiveManagementEvents connects to the Management Service event stream to receive updates from the management service
 // E.g. when a new peer has been registered and we are allowed to connect to it.
 func (e *Engine) receiveManagementEvents() {
-	go func() {
-		err := e.mgmClient.Sync(func(update *mgmProto.SyncResponse) error {
-			return e.handleSync(update)
-		})
-		if err != nil {
-			// happens if management is unavailable for a long time.
-			// We want to cancel the operation of the whole client
-			_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
-			e.cancel()
-			return
-		}
-		log.Debugf("stopped receiving updates from Management Service")
-	}()
 	log.Debugf("connecting to Management Service updates stream")
+
+	err := e.mgmClient.Sync(e.handleSync)
+	if err != nil {
+		// happens if management is unavailable for a long time.
+		// We want to cancel the operation of the whole client
+		_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
+		e.cancel()
+		return
+	}
+	log.Debugf("stopped receiving updates from Management Service")
+}
+
+func (e *Engine) receiveDispatcherEvents() {
+	log.Debugf("connecting to Dispatcher stream")
+
+	err := e.mgmClient.Dispatcher(e.visitorHandler)
+	if err != nil {
+		// happens if management is unavailable for a long time.
+		// We want to cancel the operation of the whole client
+		_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
+		e.cancel()
+		return
+	}
+	log.Debugf("stopped receiving updates from WebExchange")
 }
 
 func (e *Engine) updateSTUNs(stuns []*mgmProto.HostConfig) error {
@@ -640,7 +657,7 @@ func (e *Engine) updateNetworkMap(networkMap *mgmProto.NetworkMap) error {
 				if config.GetSshConfig() != nil && config.GetSshConfig().GetSshPubKey() != nil {
 					err := e.sshServer.AddAuthorizedKey(config.WgPubKey, string(config.GetSshConfig().GetSshPubKey()))
 					if err != nil {
-						log.Warnf("failed adding authorized key to SSH DefaultServer %v", err)
+						log.Warnf("failed adding authroized key to SSH DefaultServer %v", err)
 					}
 				}
 			}
@@ -889,72 +906,68 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs string) (*peer.Conn, e
 
 // receiveSignalEvents connects to the Signal Service event stream to negotiate connection with remote peers
 func (e *Engine) receiveSignalEvents() {
-	go func() {
-		// connect to a stream of messages coming from the signal server
-		err := e.signal.Receive(func(msg *sProto.Message) error {
-			e.syncMsgMux.Lock()
-			defer e.syncMsgMux.Unlock()
+	// connect to a stream of messages coming from the signal server
+	err := e.signal.Receive(func(msg *sProto.Message) error {
+		e.syncMsgMux.Lock()
+		defer e.syncMsgMux.Unlock()
 
-			conn := e.peerConns[msg.Key]
-			if conn == nil {
-				return fmt.Errorf("wrongly addressed message %s", msg.Key)
-			}
-
-			switch msg.GetBody().Type {
-			case sProto.Body_OFFER:
-				remoteCred, err := signal.UnMarshalCredential(msg)
-				if err != nil {
-					return err
-				}
-
-				conn.RegisterProtoSupportMeta(msg.Body.GetFeaturesSupported())
-
-				conn.OnRemoteOffer(peer.OfferAnswer{
-					IceCredentials: peer.IceCredentials{
-						UFrag: remoteCred.UFrag,
-						Pwd:   remoteCred.Pwd,
-					},
-					WgListenPort: int(msg.GetBody().GetWgListenPort()),
-					Version:      msg.GetBody().GetNetBirdVersion(),
-				})
-			case sProto.Body_ANSWER:
-				remoteCred, err := signal.UnMarshalCredential(msg)
-				if err != nil {
-					return err
-				}
-
-				conn.RegisterProtoSupportMeta(msg.Body.GetFeaturesSupported())
-
-				conn.OnRemoteAnswer(peer.OfferAnswer{
-					IceCredentials: peer.IceCredentials{
-						UFrag: remoteCred.UFrag,
-						Pwd:   remoteCred.Pwd,
-					},
-					WgListenPort: int(msg.GetBody().GetWgListenPort()),
-					Version:      msg.GetBody().GetNetBirdVersion(),
-				})
-			case sProto.Body_CANDIDATE:
-				candidate, err := ice.UnmarshalCandidate(msg.GetBody().Payload)
-				if err != nil {
-					log.Errorf("failed on parsing remote candidate %s -> %s", candidate, err)
-					return err
-				}
-				conn.OnRemoteCandidate(candidate)
-			case sProto.Body_MODE:
-			}
-
-			return nil
-		})
-		if err != nil {
-			// happens if signal is unavailable for a long time.
-			// We want to cancel the operation of the whole client
-			_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
-			e.cancel()
-			return
+		conn := e.peerConns[msg.Key]
+		if conn == nil {
+			return fmt.Errorf("wrongly addressed message %s", msg.Key)
 		}
-	}()
 
-	e.signal.WaitStreamConnected()
+		switch msg.GetBody().Type {
+		case sProto.Body_OFFER:
+			remoteCred, err := signal.UnMarshalCredential(msg)
+			if err != nil {
+				return err
+			}
+
+			conn.RegisterProtoSupportMeta(msg.Body.GetFeaturesSupported())
+
+			conn.OnRemoteOffer(peer.OfferAnswer{
+				IceCredentials: peer.IceCredentials{
+					UFrag: remoteCred.UFrag,
+					Pwd:   remoteCred.Pwd,
+				},
+				WgListenPort: int(msg.GetBody().GetWgListenPort()),
+				Version:      msg.GetBody().GetNetBirdVersion(),
+			})
+		case sProto.Body_ANSWER:
+			remoteCred, err := signal.UnMarshalCredential(msg)
+			if err != nil {
+				return err
+			}
+
+			conn.RegisterProtoSupportMeta(msg.Body.GetFeaturesSupported())
+
+			conn.OnRemoteAnswer(peer.OfferAnswer{
+				IceCredentials: peer.IceCredentials{
+					UFrag: remoteCred.UFrag,
+					Pwd:   remoteCred.Pwd,
+				},
+				WgListenPort: int(msg.GetBody().GetWgListenPort()),
+				Version:      msg.GetBody().GetNetBirdVersion(),
+			})
+		case sProto.Body_CANDIDATE:
+			candidate, err := ice.UnmarshalCandidate(msg.GetBody().Payload)
+			if err != nil {
+				log.Errorf("failed on parsing remote candidate %s -> %s", candidate, err)
+				return err
+			}
+			conn.OnRemoteCandidate(candidate)
+		case sProto.Body_MODE:
+		}
+
+		return nil
+	})
+	if err != nil {
+		// happens if signal is unavailable for a long time.
+		// We want to cancel the operation of the whole client
+		_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
+		e.cancel()
+		return
+	}
 }
 
 func (e *Engine) parseNATExternalIPMappings() []string {

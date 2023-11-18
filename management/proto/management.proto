@@ -18,6 +18,8 @@ service ManagementService {
   // Returns encrypted SyncResponse in EncryptedMessage.Body
   rpc Sync(EncryptedMessage) returns (stream EncryptedMessage) {}
 
+  rpc Dispatcher(stream EncryptedMessage) returns (stream EncryptedMessage) {}
+
   // Exposes a Wireguard public key of the Management service.
   // This key is used to support message encryption between client and server
   rpc GetServerKey(Empty) returns (ServerKeyResponse) {}
@@ -350,4 +352,9 @@ message FirewallRule {
     UDP = 3;
     ICMP = 4;
   }
+}
+
+message DispatchSessionData  {
+  string sessionId = 1;
+  bytes data = 2;
 }
